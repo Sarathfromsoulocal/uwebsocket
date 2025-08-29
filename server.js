@@ -1,52 +1,129 @@
 // node server.js
 const uWS = require('uWebSockets.js');
-const http = require('http');
 const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+const http = require("http");
 
+const adminClients = new Set();  // store client IDs of admins
+const clients = new Map();       // store all clients
+const urls = new Set();
 let logs = [];
-let clientCounter = 0;
 
-// Store raw ISO time, not formatted string
+// add log entry
 function addLog(msg) {
     logs.push({ time: new Date().toISOString(), message: msg });
     if (logs.length > 1000) logs.shift();
+    console.log("[LOG]", msg);
 }
 
-
-// --- WebSocket Server ---
 uWS.App().ws('/*', {
+    // new connection
     open: (ws) => {
-        clientCounter++;
-        ws.clientId = clientCounter;
-        addLog(`Client ${ws.clientId} connected`);
+        const clientId = uuidv4();
+        ws.clientId = clientId;   // attach ID to the socket
+        clients.set(clientId, ws);
 
-        // Notify Odoo (POST)
-        axios.post('http://192.168.0.2:8069/web/chat_view_socket_reciver', {
-        message: { client_id: ws.clientId, message: 'Client Connected!' }
-        }, {
-        headers: { 'Content-Type': 'application/json' }
-        }).then(res => {
-        addLog(`Odoo Response: ${JSON.stringify(res.data)}`);
-        }).catch(err => {
-        addLog(`Odoo Error: ${err.message}`);
-        });
+        addLog(`Client connected with ID: ${clientId}. Total clients: ${clients.size}`);
     },
 
+    // message received
     message: (ws, message, isBinary) => {
-        const msg = Buffer.from(message).toString();
-        addLog(`Client ${ws.clientId} says: ${msg}`);
+        try {
+            const msgText = Buffer.from(message).toString();
+            const in_message = JSON.parse(msgText);
+
+            addLog(`Received from ${ws.clientId}: ${msgText}`);
+
+            if (in_message.message?.message === 'Client Connected!') {
+                const data = { message: { client_id: ws.clientId, message: in_message } };
+                if (in_message.url) {
+                    urls.add(in_message.url);
+                    axios.post(in_message.url + 'web/chat_view_socket_reciver', data, {
+                        headers: { 'Content-Type': 'application/json' }
+                    })
+                    .then(r => addLog(`Forwarded to ${in_message.url}`))
+                    .catch(e => addLog(`Error posting to ${in_message.url}: ${e.message}`));
+                }
+                addLog(`Connected Customer App Client ID : ${ws.clientId}`);
+            } 
+            else if (in_message.message === 'Hello Server!') {
+                adminClients.add(ws.clientId);
+                try {
+                    ws.send(JSON.stringify({
+                        client_id: ws.clientId,
+                        message: { message: `You are now marked as an admin, client ${ws.clientId}` }
+                    }));
+                } catch {}
+                addLog(`Connected Admin ID : ${ws.clientId}`);
+            }
+
+            // send to a specific client
+            if (in_message.client_id) {
+                const target = clients.get(in_message.client_id);
+                if (target) {
+                    try {
+                        target.send(JSON.stringify(in_message));
+                        addLog(`Sent to ${in_message.client_id}`);
+                    } catch {
+                        addLog(`Failed to send to ${in_message.client_id}`);
+                    }
+                } else {
+                    try {
+                        ws.send(JSON.stringify({ status: "Closed" }));
+                    } catch {}
+                }
+            } 
+            // otherwise, forward to all admins
+            else {
+                adminClients.forEach((adminId) => {
+                    const admin = clients.get(adminId);
+                    if (admin) {
+                        try {
+                            admin.send(JSON.stringify({ client_id: ws.clientId, message: in_message }));
+                        } catch {}
+                    }
+                });
+            }
+        } catch (error) {
+            addLog(`Message parse error from ${ws.clientId}: ${error.message}`);
+            urls.forEach(url => {
+                axios.post(url + '/admin/sent_whatsapp_admin',
+                    JSON.stringify({ status: "Error Web Socket Server : " + error.message }),
+                    { headers: { 'Content-Type': 'application/json' } }
+                ).catch(() => {});
+            });
+        }
     },
 
+    // client disconnected
     close: (ws, code, msg) => {
-        addLog(`Client ${ws.clientId} disconnected`);
+        if (!ws.clientId) return;
+
+        clients.delete(ws.clientId);
+        adminClients.delete(ws.clientId);
+
+        adminClients.forEach((adminId) => {
+            const admin = clients.get(adminId);
+            if (admin) {
+                try {
+                    admin.send(JSON.stringify({
+                        client_id: ws.clientId,
+                        message: { message: { message: 'Client Disconnected!' } }
+                    }));
+                } catch {}
+            }
+        });
+
+        addLog(`Client with ID ${ws.clientId} disconnected. Total clients: ${clients.size}`);
     }
-    }).listen(9001, (token) => {
+}).listen(9001, (token) => {
     if (token) {
         console.log('✅ WebSocket server listening on ws://localhost:9001');
     } else {
         console.log('❌ Failed to listen to port 9001');
     }
 });
+
 
 
 // --- HTTP Server (log viewer + API) ---
